@@ -1,0 +1,6 @@
+.env
+.venv/
+__pycache__/
+*.py[cod]
+copilot_cost_management.db*
+*.egg-info/
