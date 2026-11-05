@@ -8,8 +8,7 @@ from inspect import Parameter
 from typing import Any
 from typing import get_type_hints
 from urllib.parse import quote
-import azure.functions as func
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 from .auth import graph_access_token, token_provider
 from .config import settings
 from .finops import (
@@ -30,16 +29,22 @@ from .pricing import (
 from .scheduler import daily_snapshot_scheduler
 from .store import store
 
-azure_mcp_app = func.FunctionApp()
 mcp = FastMCP("copilot-cost-management", host=settings.mcp_host, port=settings.mcp_port)
+web_mcp = FastMCP(
+    "copilot-cost-management",
+    host="0.0.0.0",
+    port=settings.mcp_port,
+    json_response=True,
+    stateless_http=True,
+)
 ROOT = "copilot/costManagement"
 
 
-def _get_user_access_token(context: func.MCPToolContext) -> str:
-    transport = context.get("transport")
-    properties = transport.get("properties") if isinstance(transport, dict) else None
-    headers = properties.get("headers") if isinstance(properties, dict) else None
-    if not isinstance(headers, dict):
+def _get_user_access_token(context: Context) -> str:
+    request_context = context.request_context
+    request = request_context.request if request_context else None
+    headers = getattr(request, "headers", None)
+    if headers is None:
         raise PermissionError("Microsoft Entra authentication headers were not provided.")
 
     normalized_headers = {
@@ -56,7 +61,7 @@ def _get_user_access_token(context: func.MCPToolContext) -> str:
     if not token:
         raise PermissionError(
             "No delegated user token was found. Enable Microsoft Entra App Service "
-            "Authentication and its token store for the Function App."
+            "Authentication and its token store for the Web App."
         )
     return token
 
@@ -79,7 +84,7 @@ def _get_access_token_scopes(access_token: str) -> set[str]:
     return set(scopes.split())
 
 
-def _functions_mcp_handler(
+def _web_mcp_handler(
     tool: Callable[..., Any],
 ) -> Callable[..., Awaitable[str]]:
     signature = inspect.signature(tool)
@@ -89,14 +94,14 @@ def _functions_mcp_handler(
         for name, parameter in signature.parameters.items()
     ]
     context_parameter = Parameter(
-        "mcp_context",
+        "ctx",
         Parameter.KEYWORD_ONLY,
-        annotation=func.MCPToolContext,
+        annotation=Context,
     )
     handler_signature = signature.replace(parameters=[*parameters, context_parameter])
 
     async def handler(**kwargs: Any) -> str:
-        context = kwargs.pop("mcp_context")
+        context = kwargs.pop("ctx")
         user_token = _get_user_access_token(context)
         if settings.mcp_api_scope not in _get_access_token_scopes(user_token):
             raise PermissionError(
@@ -122,17 +127,25 @@ def _functions_mcp_handler(
     handler.__qualname__ = tool.__qualname__
     handler.__module__ = tool.__module__
     handler.__doc__ = tool.__doc__
+    handler.__annotations__ = {
+        **{
+            name: type_hints.get(name, parameter.annotation)
+            for name, parameter in signature.parameters.items()
+        },
+        "ctx": Context,
+        "return": str,
+    }
     setattr(handler, "__signature__", handler_signature)
     return handler
 
 
 def _register_mcp_tool(
-    *, functions_hosted: bool = True
+    *, web_hosted: bool = True
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     def decorator(tool: Callable[..., Any]) -> Callable[..., Any]:
         mcp.tool()(tool)
-        if functions_hosted:
-            azure_mcp_app.mcp_tool()(_functions_mcp_handler(tool))
+        if web_hosted:
+            web_mcp.tool()(_web_mcp_handler(tool))
         return tool
 
     return decorator
@@ -142,12 +155,12 @@ def _policy_path(pid: str) -> str: return f"{ROOT}/spendingPolicies/{quote(pid, 
 def _proposal(action: str, payload: dict[str, Any], reason: str, requested_by: str):
     return store.propose(action, payload, reason, requested_by)
 
-@_register_mcp_tool(functions_hosted=False)
+@_register_mcp_tool(web_hosted=False)
 def start_delegated_login() -> dict[str, str | int | None]:
     """Open browser-based delegated sign-in without blocking the MCP request."""
     return token_provider.start_delegated_login()
 
-@_register_mcp_tool(functions_hosted=False)
+@_register_mcp_tool(web_hosted=False)
 def get_delegated_login_status() -> dict[str, str | int | None]:
     """Check whether browser-based delegated sign-in has completed."""
     return token_provider.delegated_login_status()
@@ -408,7 +421,7 @@ async def _capture_full_tenant_snapshot() -> dict[str, Any]:
         result = await capture_tenant_finops_snapshot()
     return result
 
-@_register_mcp_tool(functions_hosted=False)
+@_register_mcp_tool(web_hosted=False)
 def start_daily_finops_snapshot_schedule() -> dict[str, Any]:
     """Start an immediate tenant snapshot and repeat daily while this MCP process stays running."""
     if settings.auth_mode.lower().strip() == "obo":
@@ -418,12 +431,12 @@ def start_daily_finops_snapshot_schedule() -> dict[str, Any]:
         )
     return daily_snapshot_scheduler.start(_capture_full_tenant_snapshot)
 
-@_register_mcp_tool(functions_hosted=False)
+@_register_mcp_tool(web_hosted=False)
 def stop_daily_finops_snapshot_schedule() -> dict[str, Any]:
     """Stop the in-process daily snapshot schedule."""
     return daily_snapshot_scheduler.stop()
 
-@_register_mcp_tool(functions_hosted=False)
+@_register_mcp_tool(web_hosted=False)
 def get_daily_finops_snapshot_schedule_status() -> dict[str, Any]:
     """Get status for the process-local daily snapshot schedule."""
     return daily_snapshot_scheduler.status()

@@ -1,8 +1,0 @@
-.env
-.venv/
-.git/
-.pytest_cache/
-__pycache__/
-*.py[cod]
-copilot_cost_management.db*
-*.egg-info/

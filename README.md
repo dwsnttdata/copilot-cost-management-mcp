@@ -66,34 +66,36 @@ python -m copilot_cost_management
 }
 ```
 
-## Azure Functions deployment
+## Azure Web App deployment
 
-The Azure Functions host exposes the tools through the native Azure Functions MCP
-extension. Microsoft Entra App Service Authentication protects the MCP connection and
-provides the signed-in user's access token to each function. The function exchanges
-that token for Microsoft Graph using the on-behalf-of (OBO) flow.
+This project runs as a standard Linux Azure Web App using the MCP Streamable HTTP
+transport. The MCP endpoint is:
+
+```text
+https://<web-app-name>.azurewebsites.net/mcp
+```
+
+Create a Linux Web App using Python 3.12. Set its startup command to:
+
+```text
+python -m uvicorn web_app:app --host 0.0.0.0 --port 8000
+```
 
 The Entra app registration used for the MCP API must expose the `Mcp.Access` delegated
 scope and have the Microsoft Graph delegated permissions listed below, with consent
-granted as required. The MCP endpoint in Azure is:
+granted as required. In the Web App's **Authentication** settings, add Microsoft Entra
+as the identity provider using that app registration, require authentication, and
+enable the token store. For unauthenticated API requests, return HTTP 401 rather than
+redirecting to a browser. Add the MCP API's Application ID URI as an allowed audience.
+Configure the provider's login parameters to request
+`openid profile offline_access api://<application-client-id>/Mcp.Access`; this makes
+the MCP API access token available to the app for the OBO exchange. Do not leave the
+MCP endpoint accessible without authentication.
 
-```text
-https://<function-app>.azurewebsites.net/runtime/webhooks/mcp
-```
-
-In the Function App's **Authentication** settings, add Microsoft Entra as the identity
-provider, require authentication for unauthenticated requests, and enable its token
-store. Add the MCP API's Application ID URI as an allowed audience. Configure protected
-resource metadata with the full delegated scope (for example
-`api://<application-client-id>/Mcp.Access`). Do not expose this endpoint anonymously
-without App Service Authentication enabled.
-
-The Function App uses a confidential client for the OBO exchange. Create a client
-secret in the MCP API app registration under **Certificates & secrets**; copy the
-secret's **Value** once and store it securely. A managed identity with a federated
-credential can replace the secret as a later hardening step.
-
-Set these Function App application settings:
+The Web App uses a confidential client for OBO. Create a client secret in the MCP API
+app registration under **Certificates & secrets** and configure the same client ID and
+secret in the Web App's Entra identity-provider settings. Also set the secret as the
+`CLIENT_SECRET` application setting for the OBO exchange:
 
 ```text
 TENANT_ID=<tenant ID>
@@ -102,23 +104,23 @@ CLIENT_SECRET=<secret value for that registration>
 AUTH_MODE=obo
 MCP_API_SCOPE=Mcp.Access
 GRAPH_BASE_URL=https://graph.microsoft.com/beta
-WEBSITE_AUTH_PRM_DEFAULT_WITH_SCOPES=api://<application-client-id>/Mcp.Access
+SCM_DO_BUILD_DURING_DEPLOYMENT=true
 ```
 
-Store `CLIENT_SECRET` as a Key Vault reference rather than a plain setting when
-possible. Do not use `AUTH_MODE=interactive` in Azure: it tries to open a browser on
-the server. Keep `AUTH_MODE=interactive` for the local VS Code setup above. The
-in-process daily snapshot scheduler and browser-login tools are intentionally not
-exposed by the hosted Functions MCP endpoint.
+Set the startup command under **Configuration → General settings → Startup Command**.
+Store `CLIENT_SECRET` as a Key Vault reference when possible. Do not use
+`AUTH_MODE=interactive` in Azure: it tries to open a browser on the server. Keep
+`AUTH_MODE=interactive` for the local VS Code setup above. Browser-login tools and the
+process-local daily snapshot scheduler are intentionally not exposed by the Web App.
 
-The host sets the MCP webhook authorization level to `Anonymous` so Entra App Service
-Authentication can authorize the MCP request. Keep App Service Authentication set to
-**Require authentication**; otherwise the MCP endpoint would be publicly callable.
+For GitHub Actions deployment, create the repository variable `AZURE_WEBAPP_NAME` and
+the secret `AZURE_WEBAPP_PUBLISH_PROFILE` from the Web App's **Get publish profile**
+option. The workflow builds and tests the project, then deploys it to that Web App.
 
-The current SQLite audit and FinOps stores are local files. Azure Functions local
-storage isn't a production persistence layer, and SQLite can fail in package-based or
-scaled-out deployments. Before using tools that write proposals, approvals, or
-snapshots in production, move these stores to durable shared storage.
+The current SQLite audit and FinOps stores are local files. Web App local storage
+isn't a durable shared persistence layer and can be lost during redeployment or app
+replacement. Before using tools that write proposals, approvals, or snapshots in
+production, move these stores to durable shared storage.
 
 ## Required Microsoft Graph permissions
 

@@ -1,7 +1,4 @@
-# Docs for the Azure Functions deploy action: https://github.com/azure/functions-action
-# More info for Python, GitHub Actions, and Azure Functions: https://aka.ms/python-webapps-actions
-
-name: Build and deploy Python project to Azure Function App - copilot-cos-management
+name: Build and deploy Python project to Azure Web App
 
 on:
   push:
@@ -10,7 +7,6 @@ on:
   workflow_dispatch:
 
 env:
-  AZURE_FUNCTIONAPP_PACKAGE_PATH: '.'
   PYTHON_VERSION: '3.12'
 
 jobs:
@@ -23,7 +19,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Python version
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
@@ -32,18 +28,19 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Run tests
-        run: PYTHONPATH=src python -m unittest discover -s tests
+        run: PYTHONPATH=src python -m unittest discover -s tests -v
         env:
           TENANT_ID: 00000000-0000-0000-0000-000000000000
           CLIENT_ID: 00000000-0000-0000-0000-000000000000
           AUTH_MODE: interactive
 
-      - name: Zip deployment package
-        run: >
-          zip release.zip function_app.py host.json requirements.txt pyproject.toml
-          .funcignore .env.example src
+      - name: Check Python syntax
+        run: python -m compileall -q src web_app.py
 
-      - name: Upload artifact for deployment
+      - name: Package Web App
+        run: zip -r release.zip web_app.py requirements.txt pyproject.toml src
+
+      - name: Upload deployment package
         uses: actions/upload-artifact@v4
         with:
           name: python-app
@@ -54,17 +51,14 @@ jobs:
     needs: build
 
     steps:
-      - name: Download artifact for deployment
+      - name: Download deployment package
         uses: actions/download-artifact@v4
         with:
           name: python-app
 
-      - name: Deploy to Azure Functions
-        uses: Azure/functions-action@v1
+      - name: Deploy to Azure Web App
+        uses: azure/webapps-deploy@v3
         with:
-          app-name: 'copilot-cos-management'
-          slot-name: 'Production'
+          app-name: ${{ vars.AZURE_WEBAPP_NAME }}
+          publish-profile: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE }}
           package: release.zip
-          publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_4329C72FAA544E729811765705E06283 }}
-          sku: 'flexconsumption'
-          remote-build: true
