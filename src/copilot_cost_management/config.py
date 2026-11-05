@@ -7,6 +7,7 @@ class Settings(BaseSettings):
     client_id: str
     client_secret: str | None = None
     auth_mode: str = "client_credentials"
+    mcp_api_scope: str = "Mcp.Access"
     graph_base_url: str = "https://graph.microsoft.com/beta"
     mcp_transport: str = "stdio"
     mcp_host: str = "127.0.0.1"

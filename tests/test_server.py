@@ -40,6 +40,11 @@ class TenantCreditBalanceTests(unittest.IsolatedAsyncioTestCase):
             prompt="select_account",
         )
 
+    def test_hosted_obo_cannot_start_process_local_snapshot_schedule(self):
+        with patch.object(server.settings, "auth_mode", "obo"):
+            with self.assertRaisesRegex(PermissionError, "can't reuse a user's request token"):
+                server.start_daily_finops_snapshot_schedule()
+
     async def test_policy_recommendations_use_service_balance_rows(self):
         rows = [
             {

@@ -23,7 +23,14 @@ from .pricing import (
 from .scheduler import daily_snapshot_scheduler
 from .store import store
 
-mcp = FastMCP("copilot-cost-management", host=settings.mcp_host, port=settings.mcp_port)
+is_hosted_obo = settings.auth_mode.lower().strip() == "obo"
+mcp = FastMCP(
+    "copilot-cost-management",
+    host=settings.mcp_host,
+    port=settings.mcp_port,
+    json_response=is_hosted_obo,
+    stateless_http=is_hosted_obo,
+)
 ROOT = "copilot/costManagement"
 
 def _policy_path(pid: str) -> str: return f"{ROOT}/spendingPolicies/{quote(pid, safe='')}"
@@ -299,6 +306,11 @@ async def _capture_full_tenant_snapshot() -> dict[str, Any]:
 @mcp.tool()
 def start_daily_finops_snapshot_schedule() -> dict[str, Any]:
     """Start an immediate tenant snapshot and repeat daily while this MCP process stays running."""
+    if settings.auth_mode.lower().strip() == "obo":
+        raise PermissionError(
+            "In hosted OBO mode, scheduled work can't reuse a user's request token. "
+            "Run snapshots from an authenticated request or configure a separate scheduled identity."
+        )
     return daily_snapshot_scheduler.start(_capture_full_tenant_snapshot)
 
 @mcp.tool()

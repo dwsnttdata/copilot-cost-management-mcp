@@ -66,6 +66,51 @@ python -m copilot_cost_management
 }
 ```
 
+## Azure Functions deployment
+
+The Azure Functions host uses the Streamable HTTP MCP transport and delegated
+on-behalf-of (OBO) authentication. Copilot Studio sends a user access token for this
+MCP API; the function exchanges it for a Microsoft Graph token. The MCP API's Entra
+app registration must therefore expose the `Mcp.Access` delegated scope and have the
+Graph delegated permissions listed below, with consent granted as required.
+The hosted MCP endpoint is stateless and uses JSON responses for compatibility with
+serverless HTTP hosting.
+
+In that Entra app registration, add the Graph permissions under **API permissions →
+Add a permission → Microsoft Graph → Delegated permissions**. Create a client secret
+under **Certificates & secrets** for the OBO exchange; copy the secret's **Value** once
+and store it securely. The API scope (`Mcp.Access`) lets Copilot Studio call the MCP;
+the Graph permissions let the MCP call Graph as the signed-in user.
+
+Set these Function App application settings:
+
+```text
+TENANT_ID=<tenant ID>
+CLIENT_ID=<Application (client) ID of the MCP API registration>
+CLIENT_SECRET=<secret value for that registration>
+AUTH_MODE=obo
+MCP_API_SCOPE=Mcp.Access
+GRAPH_BASE_URL=https://graph.microsoft.com/beta
+```
+
+Store `CLIENT_SECRET` as a Key Vault reference rather than a plain setting when
+possible. The Function host uses anonymous HTTP trigger authorization because it
+validates the Entra bearer token itself; do not make the MCP endpoint public without
+that application-level authentication.
+
+Deploy this folder as a Python Azure Functions v2 programming model app. The HTTP
+function captures routes at the root, and the MCP route is `/mcp`, so the endpoint is
+`https://<function-app>.azurewebsites.net/api/mcp` with the default Functions route
+prefix. Do not use `AUTH_MODE=interactive` in Azure: it tries to open
+a browser on the server. Keep `AUTH_MODE=interactive` for the local VS Code setup
+above. The in-process daily snapshot scheduler is disabled for hosted OBO requests;
+it can't safely reuse a user's short-lived request token in background work.
+
+The current SQLite audit and FinOps stores are local files. Azure Functions local
+storage isn't a production persistence layer, and SQLite can fail in package-based or
+scaled-out deployments. Before using tools that write proposals, approvals, or
+snapshots in production, move these stores to durable shared storage.
+
 ## Required Microsoft Graph permissions
 
 Read:
