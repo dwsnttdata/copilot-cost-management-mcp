@@ -58,6 +58,21 @@ class WebAppMCPTests(unittest.IsolatedAsyncioTestCase):
             "user-token",
         )
 
+    def test_authorization_bearer_takes_precedence_over_easy_auth_token(self):
+        bearer = _access_token("Mcp.Access")
+        easy_auth = _access_token("User.Read")
+        self.assertEqual(
+            _get_user_access_token(
+                _context(
+                    {
+                        "authorization": f"Bearer {bearer}",
+                        "X-MS-TOKEN-AAD-ACCESS-TOKEN": easy_auth,
+                    }
+                )
+            ),
+            bearer,
+        )
+
     def test_missing_user_token_fails_explicitly(self):
         with self.assertRaisesRegex(PermissionError, "token store"):
             _get_user_access_token(_context({}))
@@ -80,6 +95,7 @@ class WebAppMCPTests(unittest.IsolatedAsyncioTestCase):
             with TestClient(app_module.app) as client:
                 headers = {
                     "Accept": "application/json, text/event-stream",
+                    "Authorization": f"Bearer {user_token}",
                     "X-MS-TOKEN-AAD-ACCESS-TOKEN": user_token,
                 }
                 initialized = client.post(

@@ -52,12 +52,11 @@ def _get_user_access_token(context: Context) -> str:
         for key, value in headers.items()
         if isinstance(key, str) and isinstance(value, str)
     }
-    token = normalized_headers.get("x-ms-token-aad-access-token", "")
+    authorization = normalized_headers.get("authorization", "")
+    scheme, separator, value = authorization.partition(" ")
+    token = value.strip() if scheme.lower() == "bearer" and separator else ""
     if not token:
-        authorization = normalized_headers.get("authorization", "")
-        scheme, separator, value = authorization.partition(" ")
-        if scheme.lower() == "bearer" and separator:
-            token = value.strip()
+        token = normalized_headers.get("x-ms-token-aad-access-token", "")
     if not token:
         raise PermissionError(
             "No delegated user token was found. Enable Microsoft Entra App Service "

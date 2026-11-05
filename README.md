@@ -87,10 +87,13 @@ granted as required. In the Web App's **Authentication** settings, add Microsoft
 as the identity provider using that app registration, require authentication, and
 enable the token store. For unauthenticated API requests, return HTTP 401 rather than
 redirecting to a browser. Add the MCP API's Application ID URI as an allowed audience.
-Configure the provider's login parameters to request
-`openid profile offline_access api://<application-client-id>/Mcp.Access`; this makes
-the MCP API access token available to the app for the OBO exchange. Do not leave the
-MCP endpoint accessible without authentication.
+Configure Copilot Studio to request the full delegated scope
+`<Application-ID-URI>/Mcp.Access`, using the exact Application ID URI from **Expose an
+API** (if that URI already ends with `/Mcp.Access`, the full scope ends with
+`/Mcp.Access/Mcp.Access`). The MCP server uses Copilot Studio's incoming `Authorization:
+Bearer` token for OBO and falls back to the App Service provider token only when no
+bearer token is supplied. Do not leave the MCP endpoint accessible without
+authentication.
 
 The Web App uses a confidential client for OBO. Create a client secret in the MCP API
 app registration under **Certificates & secrets** and configure the same client ID and
