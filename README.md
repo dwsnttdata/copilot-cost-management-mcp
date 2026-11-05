@@ -68,19 +68,30 @@ python -m copilot_cost_management
 
 ## Azure Functions deployment
 
-The Azure Functions host uses the Streamable HTTP MCP transport and delegated
-on-behalf-of (OBO) authentication. Copilot Studio sends a user access token for this
-MCP API; the function exchanges it for a Microsoft Graph token. The MCP API's Entra
-app registration must therefore expose the `Mcp.Access` delegated scope and have the
-Graph delegated permissions listed below, with consent granted as required.
-The hosted MCP endpoint is stateless and uses JSON responses for compatibility with
-serverless HTTP hosting.
+The Azure Functions host exposes the tools through the native Azure Functions MCP
+extension. Microsoft Entra App Service Authentication protects the MCP connection and
+provides the signed-in user's access token to each function. The function exchanges
+that token for Microsoft Graph using the on-behalf-of (OBO) flow.
 
-In that Entra app registration, add the Graph permissions under **API permissions →
-Add a permission → Microsoft Graph → Delegated permissions**. Create a client secret
-under **Certificates & secrets** for the OBO exchange; copy the secret's **Value** once
-and store it securely. The API scope (`Mcp.Access`) lets Copilot Studio call the MCP;
-the Graph permissions let the MCP call Graph as the signed-in user.
+The Entra app registration used for the MCP API must expose the `Mcp.Access` delegated
+scope and have the Microsoft Graph delegated permissions listed below, with consent
+granted as required. The MCP endpoint in Azure is:
+
+```text
+https://<function-app>.azurewebsites.net/runtime/webhooks/mcp
+```
+
+In the Function App's **Authentication** settings, add Microsoft Entra as the identity
+provider, require authentication for unauthenticated requests, and enable its token
+store. Add the MCP API's Application ID URI as an allowed audience. Configure protected
+resource metadata with the full delegated scope (for example
+`api://<application-client-id>/Mcp.Access`). Do not expose this endpoint anonymously
+without App Service Authentication enabled.
+
+The Function App uses a confidential client for the OBO exchange. Create a client
+secret in the MCP API app registration under **Certificates & secrets**; copy the
+secret's **Value** once and store it securely. A managed identity with a federated
+credential can replace the secret as a later hardening step.
 
 Set these Function App application settings:
 
@@ -91,20 +102,18 @@ CLIENT_SECRET=<secret value for that registration>
 AUTH_MODE=obo
 MCP_API_SCOPE=Mcp.Access
 GRAPH_BASE_URL=https://graph.microsoft.com/beta
+WEBSITE_AUTH_PRM_DEFAULT_WITH_SCOPES=api://<application-client-id>/Mcp.Access
 ```
 
 Store `CLIENT_SECRET` as a Key Vault reference rather than a plain setting when
-possible. The Function host uses anonymous HTTP trigger authorization because it
-validates the Entra bearer token itself; do not make the MCP endpoint public without
-that application-level authentication.
+possible. Do not use `AUTH_MODE=interactive` in Azure: it tries to open a browser on
+the server. Keep `AUTH_MODE=interactive` for the local VS Code setup above. The
+in-process daily snapshot scheduler and browser-login tools are intentionally not
+exposed by the hosted Functions MCP endpoint.
 
-Deploy this folder as a Python Azure Functions v2 programming model app. The HTTP
-function captures routes at the root, and the MCP route is `/mcp`, so the endpoint is
-`https://<function-app>.azurewebsites.net/api/mcp` with the default Functions route
-prefix. Do not use `AUTH_MODE=interactive` in Azure: it tries to open
-a browser on the server. Keep `AUTH_MODE=interactive` for the local VS Code setup
-above. The in-process daily snapshot scheduler is disabled for hosted OBO requests;
-it can't safely reuse a user's short-lived request token in background work.
+The host sets the MCP webhook authorization level to `Anonymous` so Entra App Service
+Authentication can authorize the MCP request. Keep App Service Authentication set to
+**Require authentication**; otherwise the MCP endpoint would be publicly callable.
 
 The current SQLite audit and FinOps stores are local files. Azure Functions local
 storage isn't a production persistence layer, and SQLite can fail in package-based or

@@ -1,9 +1,16 @@
 from __future__ import annotations
 import asyncio
+import base64
+import inspect
+import json
+from collections.abc import Awaitable, Callable
+from inspect import Parameter
 from typing import Any
+from typing import get_type_hints
 from urllib.parse import quote
+import azure.functions as func
 from mcp.server.fastmcp import FastMCP
-from .auth import token_provider
+from .auth import graph_access_token, token_provider
 from .config import settings
 from .finops import (
     build_chargeback,
@@ -23,76 +30,174 @@ from .pricing import (
 from .scheduler import daily_snapshot_scheduler
 from .store import store
 
-is_hosted_obo = settings.auth_mode.lower().strip() == "obo"
-mcp = FastMCP(
-    "copilot-cost-management",
-    host=settings.mcp_host,
-    port=settings.mcp_port,
-    json_response=is_hosted_obo,
-    stateless_http=is_hosted_obo,
-)
+azure_mcp_app = func.FunctionApp()
+mcp = FastMCP("copilot-cost-management", host=settings.mcp_host, port=settings.mcp_port)
 ROOT = "copilot/costManagement"
+
+
+def _get_user_access_token(context: func.MCPToolContext) -> str:
+    transport = context.get("transport")
+    properties = transport.get("properties") if isinstance(transport, dict) else None
+    headers = properties.get("headers") if isinstance(properties, dict) else None
+    if not isinstance(headers, dict):
+        raise PermissionError("Microsoft Entra authentication headers were not provided.")
+
+    normalized_headers = {
+        key.lower(): value
+        for key, value in headers.items()
+        if isinstance(key, str) and isinstance(value, str)
+    }
+    token = normalized_headers.get("x-ms-token-aad-access-token", "")
+    if not token:
+        authorization = normalized_headers.get("authorization", "")
+        scheme, separator, value = authorization.partition(" ")
+        if scheme.lower() == "bearer" and separator:
+            token = value.strip()
+    if not token:
+        raise PermissionError(
+            "No delegated user token was found. Enable Microsoft Entra App Service "
+            "Authentication and its token store for the Function App."
+        )
+    return token
+
+
+def _get_access_token_scopes(access_token: str) -> set[str]:
+    parts = access_token.split(".")
+    if len(parts) != 3:
+        raise PermissionError("The delegated access token is not a valid JWT.")
+    payload = parts[1]
+    payload += "=" * (-len(payload) % 4)
+    try:
+        claims = json.loads(base64.urlsafe_b64decode(payload))
+    except (ValueError, json.JSONDecodeError) as error:
+        raise PermissionError("The delegated access token has an invalid claims payload.") from error
+    if not isinstance(claims, dict):
+        raise PermissionError("The delegated access token has an invalid claims payload.")
+    scopes = claims.get("scp")
+    if not isinstance(scopes, str):
+        return set()
+    return set(scopes.split())
+
+
+def _functions_mcp_handler(
+    tool: Callable[..., Any],
+) -> Callable[..., Awaitable[str]]:
+    signature = inspect.signature(tool)
+    type_hints = get_type_hints(tool)
+    parameters = [
+        parameter.replace(annotation=type_hints.get(name, parameter.annotation))
+        for name, parameter in signature.parameters.items()
+    ]
+    context_parameter = Parameter(
+        "mcp_context",
+        Parameter.KEYWORD_ONLY,
+        annotation=func.MCPToolContext,
+    )
+    handler_signature = signature.replace(parameters=[*parameters, context_parameter])
+
+    async def handler(**kwargs: Any) -> str:
+        context = kwargs.pop("mcp_context")
+        user_token = _get_user_access_token(context)
+        if settings.mcp_api_scope not in _get_access_token_scopes(user_token):
+            raise PermissionError(
+                f"The delegated access token must include the '{settings.mcp_api_scope}' scope."
+            )
+        graph_token = await asyncio.to_thread(
+            token_provider.exchange_for_graph_token,
+            user_token,
+        )
+        token = graph_access_token.set(graph_token)
+        try:
+            result = tool(**kwargs)
+            if inspect.isawaitable(result):
+                result = await result
+        finally:
+            graph_access_token.reset(token)
+
+        if isinstance(result, (dict, list)):
+            return json.dumps(result)
+        return str(result)
+
+    handler.__name__ = tool.__name__
+    handler.__qualname__ = tool.__qualname__
+    handler.__module__ = tool.__module__
+    handler.__doc__ = tool.__doc__
+    setattr(handler, "__signature__", handler_signature)
+    return handler
+
+
+def _register_mcp_tool(
+    *, functions_hosted: bool = True
+) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    def decorator(tool: Callable[..., Any]) -> Callable[..., Any]:
+        mcp.tool()(tool)
+        if functions_hosted:
+            azure_mcp_app.mcp_tool()(_functions_mcp_handler(tool))
+        return tool
+
+    return decorator
+
 
 def _policy_path(pid: str) -> str: return f"{ROOT}/spendingPolicies/{quote(pid, safe='')}"
 def _proposal(action: str, payload: dict[str, Any], reason: str, requested_by: str):
     return store.propose(action, payload, reason, requested_by)
 
-@mcp.tool()
+@_register_mcp_tool(functions_hosted=False)
 def start_delegated_login() -> dict[str, str | int | None]:
     """Open browser-based delegated sign-in without blocking the MCP request."""
     return token_provider.start_delegated_login()
 
-@mcp.tool()
+@_register_mcp_tool(functions_hosted=False)
 def get_delegated_login_status() -> dict[str, str | int | None]:
     """Check whether browser-based delegated sign-in has completed."""
     return token_provider.delegated_login_status()
 
-@mcp.tool()
+@_register_mcp_tool()
 async def get_tenant_credit_balance() -> dict[str, Any]:
     """Get tenant-wide Copilot Credit balances by billing method using delegated auth."""
     return await graph.request("GET", f"{ROOT}/getTenantCreditBalance", delegated=True)
 
-@mcp.tool()
+@_register_mcp_tool()
 async def list_spending_policies() -> list[dict[str, Any]]:
     """List all Copilot spending policies."""
     return await graph.all_pages(f"{ROOT}/spendingPolicies")
 
-@mcp.tool()
+@_register_mcp_tool()
 async def get_spending_policy(policy_id: str) -> dict[str, Any]:
     """Get one spending policy, including the current parent ETag used for safe writes."""
     return await graph.request("GET", _policy_path(policy_id))
 
-@mcp.tool()
+@_register_mcp_tool()
 async def list_assigned_groups(policy_id: str) -> list[dict[str, Any]]:
     """List Entra groups assigned to a selected-groups spending policy."""
     return await graph.all_pages(f"{_policy_path(policy_id)}/microsoft.graph.selectedGroupsSpendingPolicy/assignedGroups")
 
-@mcp.tool()
+@_register_mcp_tool()
 async def list_service_settings(policy_id: str) -> list[dict[str, Any]]:
     """List service/workload settings governed by a policy."""
     return await graph.all_pages(f"{_policy_path(policy_id)}/serviceSettings")
 
-@mcp.tool()
+@_register_mcp_tool()
 async def get_service_setting(policy_id: str, service_id: str) -> dict[str, Any]:
     """Get one service setting from a policy."""
     return await graph.request("GET", f"{_policy_path(policy_id)}/serviceSettings/{quote(service_id, safe='')}")
 
-@mcp.tool()
+@_register_mcp_tool()
 async def get_alert_setting(policy_id: str) -> dict[str, Any]:
     """Get a policy's email threshold alert configuration."""
     return await graph.request("GET", f"{_policy_path(policy_id)}/emailThresholdSettings")
 
-@mcp.tool()
+@_register_mcp_tool()
 async def list_alert_recipients(policy_id: str) -> list[dict[str, Any]]:
     """List users receiving threshold alerts for a policy."""
     return await graph.all_pages(f"{_policy_path(policy_id)}/emailThresholdSettings/recipients")
 
-@mcp.tool()
+@_register_mcp_tool()
 async def resolve_user(user_principal_name: str) -> dict[str, Any]:
     """Resolve an Entra user by exact UPN and return id/displayName/UPN."""
     return await graph.request("GET", f"users/{quote(user_principal_name, safe='')}?$select=id,displayName,userPrincipalName,mail")
 
-@mcp.tool()
+@_register_mcp_tool()
 async def resolve_group(group_id_or_name: str) -> list[dict[str, Any]]:
     """Resolve an Entra group by object ID or exact display name."""
     try:
@@ -102,17 +207,17 @@ async def resolve_group(group_id_or_name: str) -> list[dict[str, Any]]:
         result = await graph.request("GET", f"groups?$filter=displayName eq '{quote(name, safe=" ''")}'&$select=id,displayName,mail")
         return result.get("value", [])
 
-@mcp.tool()
+@_register_mcp_tool()
 async def get_user_balance(user_id_or_upn: str) -> dict[str, Any]:
     """Get a named user's Copilot Credit balance and selected spending policy."""
     return await graph.request("GET", f"{ROOT}/userBalances/{quote(user_id_or_upn, safe='')}")
 
-@mcp.tool()
+@_register_mcp_tool()
 async def list_user_service_balances(user_id_or_upn: str) -> list[dict[str, Any]]:
     """List a user's Copilot Credit balances by service/workload."""
     return await graph.all_pages(f"{ROOT}/userBalances/{quote(user_id_or_upn, safe='')}/serviceBalances")
 
-@mcp.tool()
+@_register_mcp_tool()
 async def get_user_service_balance(user_id_or_upn: str, service_id: str) -> dict[str, Any]:
     """Get a user's balance for one Copilot service/workload."""
     return await graph.request("GET", f"{ROOT}/userBalances/{quote(user_id_or_upn, safe='')}/serviceBalances/{quote(service_id, safe='')}")
@@ -203,7 +308,7 @@ async def _collect_finops_user(user: dict[str, Any]) -> dict[str, Any]:
         ),
     }
 
-@mcp.tool()
+@_register_mcp_tool()
 async def capture_tenant_finops_snapshot(page_size: int = 25) -> dict[str, Any]:
     """Capture/resume a paged tenant-wide credit snapshot. Repeat until status is completed."""
     page_size = min(max(page_size, 1), 50)
@@ -303,7 +408,7 @@ async def _capture_full_tenant_snapshot() -> dict[str, Any]:
         result = await capture_tenant_finops_snapshot()
     return result
 
-@mcp.tool()
+@_register_mcp_tool(functions_hosted=False)
 def start_daily_finops_snapshot_schedule() -> dict[str, Any]:
     """Start an immediate tenant snapshot and repeat daily while this MCP process stays running."""
     if settings.auth_mode.lower().strip() == "obo":
@@ -313,17 +418,17 @@ def start_daily_finops_snapshot_schedule() -> dict[str, Any]:
         )
     return daily_snapshot_scheduler.start(_capture_full_tenant_snapshot)
 
-@mcp.tool()
+@_register_mcp_tool(functions_hosted=False)
 def stop_daily_finops_snapshot_schedule() -> dict[str, Any]:
     """Stop the in-process daily snapshot schedule."""
     return daily_snapshot_scheduler.stop()
 
-@mcp.tool()
+@_register_mcp_tool(functions_hosted=False)
 def get_daily_finops_snapshot_schedule_status() -> dict[str, Any]:
     """Get status for the process-local daily snapshot schedule."""
     return daily_snapshot_scheduler.status()
 
-@mcp.tool()
+@_register_mcp_tool()
 def get_finops_snapshot_status(snapshot_id: str) -> dict[str, Any]:
     """Get progress, coverage, failures, and status for a tenant snapshot run."""
     run = finops_store.get_run(snapshot_id)
@@ -339,7 +444,7 @@ def get_finops_snapshot_status(snapshot_id: str) -> dict[str, Any]:
         "next_page_available": run["status"] == "in_progress",
     }
 
-@mcp.tool()
+@_register_mcp_tool()
 def get_finops_period_report(
     start_date: str,
     end_date: str,
@@ -373,7 +478,7 @@ def get_finops_period_report(
     )
     return report
 
-@mcp.tool()
+@_register_mcp_tool()
 async def get_finops_snapshot_report(
     snapshot_id: str,
     top_n: int = 25,
@@ -408,7 +513,7 @@ async def get_finops_snapshot_report(
                     attach_usd_estimate(service, "consumed_credits", rate)
     return report
 
-@mcp.tool()
+@_register_mcp_tool()
 async def get_credit_chargeback(
     snapshot_id: str,
     dimension: str = "department",
@@ -433,13 +538,13 @@ async def get_credit_chargeback(
                 attach_usd_estimate(service, "consumed_credits", rate)
     return report
 
-@mcp.tool()
+@_register_mcp_tool()
 async def convert_copilot_credits_to_usd(credits: float) -> dict[str, Any]:
     """Convert Copilot Credits to an estimated USD amount using the live Microsoft Learn PAYG rate."""
     pricing = await fetch_live_copilot_credit_pricing()
     return convert_credits_to_usd(credits, pricing)
 
-@mcp.tool()
+@_register_mcp_tool()
 def find_unusual_finops_consumers(
     snapshot_id: str,
     service_id: str | None = None,
@@ -450,7 +555,7 @@ def find_unusual_finops_consumers(
         raise ValueError(f"Snapshot must be complete; current status={run['status']}")
     return build_outlier_report(run, users, service_id)
 
-@mcp.tool()
+@_register_mcp_tool()
 def forecast_finops_consumption(
     dimension: str = "tenant",
     dimension_value: str | None = None,
@@ -475,7 +580,7 @@ def forecast_finops_consumption(
         horizon_days=horizon_days,
     )
 
-@mcp.tool()
+@_register_mcp_tool()
 async def analyze_users_near_limit(user_ids_or_upns: list[str], threshold_percent: float = 80.0) -> list[dict[str, Any]]:
     """Analyze named users' service-level consumption against effective per-user limits."""
     threshold = min(max(threshold_percent, 0), 100)
@@ -500,7 +605,7 @@ async def analyze_users_near_limit(user_ids_or_upns: list[str], threshold_percen
                 )
     return sorted(output, key=lambda item: item["consumption_percent"], reverse=True)
 
-@mcp.tool()
+@_register_mcp_tool()
 async def recommend_policy_changes(user_ids_or_upns: list[str], near_limit_percent: float = 80,
                                    high_percent: float = 100) -> list[dict[str, Any]]:
     """Generate non-executing service-level recommendations from actual balance rows."""
@@ -546,75 +651,75 @@ async def recommend_policy_changes(user_ids_or_upns: list[str], near_limit_perce
     return recommendations
 
 # All mutations are proposed first.
-@mcp.tool()
+@_register_mcp_tool()
 def propose_create_policy(policy: dict[str, Any], reason: str, requested_by: str) -> dict[str, Any]:
     """Propose creation of an all-users or selected-groups policy. Does not execute."""
     return _proposal("create_policy", {"policy": policy}, reason, requested_by)
 
-@mcp.tool()
+@_register_mcp_tool()
 def propose_update_policy(policy_id: str, changes: dict[str, Any], reason: str, requested_by: str) -> dict[str, Any]:
     """Propose changing editable spending-policy fields. Does not execute."""
     return _proposal("update_policy", {"policy_id": policy_id, "changes": changes}, reason, requested_by)
 
-@mcp.tool()
+@_register_mcp_tool()
 def propose_delete_policy(policy_id: str, reason: str, requested_by: str) -> dict[str, Any]:
     """Propose deleting a spending policy. Does not execute."""
     return _proposal("delete_policy", {"policy_id": policy_id}, reason, requested_by)
 
-@mcp.tool()
+@_register_mcp_tool()
 def propose_add_group(policy_id: str, group_id: str, reason: str, requested_by: str) -> dict[str, Any]:
     """Propose assigning an Entra group to a selected-groups policy."""
     return _proposal("add_group", {"policy_id": policy_id, "group_id": group_id}, reason, requested_by)
 
-@mcp.tool()
+@_register_mcp_tool()
 def propose_remove_group(policy_id: str, group_id: str, reason: str, requested_by: str) -> dict[str, Any]:
     """Propose removing an assigned group. Graph prevents removal of the last audience group."""
     return _proposal("remove_group", {"policy_id": policy_id, "group_id": group_id}, reason, requested_by)
 
-@mcp.tool()
+@_register_mcp_tool()
 def propose_create_service_setting(policy_id: str, setting: dict[str, Any], reason: str, requested_by: str) -> dict[str, Any]:
     """Propose adding a service setting to a policy."""
     return _proposal("create_service_setting", {"policy_id": policy_id, "setting": setting}, reason, requested_by)
 
-@mcp.tool()
+@_register_mcp_tool()
 def propose_update_service_setting(policy_id: str, service_id: str, changes: dict[str, Any], reason: str, requested_by: str) -> dict[str, Any]:
     """Propose updating or disabling a service setting. Service settings are disabled, not deleted."""
     return _proposal("update_service_setting", {"policy_id": policy_id, "service_id": service_id, "changes": changes}, reason, requested_by)
 
-@mcp.tool()
+@_register_mcp_tool()
 def propose_update_alert(policy_id: str, alert_setting: dict[str, Any], reason: str, requested_by: str) -> dict[str, Any]:
     """Propose creating/updating a policy email-threshold setting."""
     return _proposal("update_alert", {"policy_id": policy_id, "alert_setting": alert_setting}, reason, requested_by)
 
-@mcp.tool()
+@_register_mcp_tool()
 def propose_delete_alert(policy_id: str, reason: str, requested_by: str) -> dict[str, Any]:
     """Propose deleting a policy email-threshold setting."""
     return _proposal("delete_alert", {"policy_id": policy_id}, reason, requested_by)
 
-@mcp.tool()
+@_register_mcp_tool()
 def propose_add_alert_recipient(policy_id: str, user_id: str, reason: str, requested_by: str) -> dict[str, Any]:
     """Propose adding an alert recipient."""
     return _proposal("add_recipient", {"policy_id": policy_id, "user_id": user_id}, reason, requested_by)
 
-@mcp.tool()
+@_register_mcp_tool()
 def propose_remove_alert_recipient(policy_id: str, user_id: str, reason: str, requested_by: str) -> dict[str, Any]:
     """Propose removing an alert recipient. Graph prevents removing the last recipient while alerting is enabled."""
     return _proposal("remove_recipient", {"policy_id": policy_id, "user_id": user_id}, reason, requested_by)
 
-@mcp.tool()
+@_register_mcp_tool()
 def get_approval_status(approval_id: str) -> dict[str, Any]: return store.get(approval_id)
 
-@mcp.tool()
+@_register_mcp_tool()
 def approve_operation(approval_id: str, approver: str) -> dict[str, Any]:
     """Approve a pending operation. In production, bind approver identity through an external approval system."""
     return store.approve(approval_id, approver)
 
-@mcp.tool()
+@_register_mcp_tool()
 def reject_operation(approval_id: str, rejected_by: str, reason: str) -> dict[str, Any]:
     """Reject a pending or approved operation."""
     return store.reject(approval_id, rejected_by, reason)
 
-@mcp.tool()
+@_register_mcp_tool()
 def get_audit_history(limit: int = 100) -> list[dict[str, Any]]: return store.history(limit)
 
 async def _etag(policy_id: str) -> str:
@@ -623,7 +728,7 @@ async def _etag(policy_id: str) -> str:
     if not etag: raise RuntimeError("Graph did not return the parent policy ETag required for safe mutation")
     return etag
 
-@mcp.tool()
+@_register_mcp_tool()
 async def execute_approved_operation(approval_id: str, executed_by: str) -> dict[str, Any]:
     """Execute one approved operation, retrieving the latest parent ETag immediately before mutation."""
     op = store.get(approval_id)

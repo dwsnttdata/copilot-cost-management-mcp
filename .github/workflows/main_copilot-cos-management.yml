@@ -33,6 +33,10 @@ jobs:
 
       - name: Run tests
         run: PYTHONPATH=src python -m unittest discover -s tests
+        env:
+          TENANT_ID: 00000000-0000-0000-0000-000000000000
+          CLIENT_ID: 00000000-0000-0000-0000-000000000000
+          AUTH_MODE: interactive
 
       - name: Zip deployment package
         run: >

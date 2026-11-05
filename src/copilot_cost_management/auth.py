@@ -151,7 +151,7 @@ class TokenProvider:
                         "Delegated sign-in is required. Call start_delegated_login first."
                     )
         else:
-            raise ValueError("AUTH_MODE must be client_credentials or interactive.")
+            raise ValueError("AUTH_MODE must be client_credentials, interactive, or obo.")
         if "access_token" not in result:
             raise RuntimeError(result.get("error_description", str(result)))
         return result["access_token"]
