@@ -85,7 +85,7 @@ def _get_access_token_scopes(access_token: str) -> set[str]:
 
 def _web_mcp_handler(
     tool: Callable[..., Any],
-) -> Callable[..., Awaitable[str]]:
+) -> Callable[..., Awaitable[Any]]:
     signature = inspect.signature(tool)
     type_hints = get_type_hints(tool)
     parameters = [
@@ -97,9 +97,13 @@ def _web_mcp_handler(
         Parameter.KEYWORD_ONLY,
         annotation=Context,
     )
-    handler_signature = signature.replace(parameters=[*parameters, context_parameter])
+    return_annotation = type_hints.get("return", signature.return_annotation)
+    handler_signature = signature.replace(
+        parameters=[*parameters, context_parameter],
+        return_annotation=return_annotation,
+    )
 
-    async def handler(**kwargs: Any) -> str:
+    async def handler(**kwargs: Any) -> Any:
         context = kwargs.pop("ctx")
         user_token = _get_user_access_token(context)
         if settings.mcp_api_scope not in _get_access_token_scopes(user_token):
@@ -118,9 +122,7 @@ def _web_mcp_handler(
         finally:
             graph_access_token.reset(token)
 
-        if isinstance(result, (dict, list)):
-            return json.dumps(result)
-        return str(result)
+        return result
 
     handler.__name__ = tool.__name__
     handler.__qualname__ = tool.__qualname__
@@ -132,7 +134,7 @@ def _web_mcp_handler(
             for name, parameter in signature.parameters.items()
         },
         "ctx": Context,
-        "return": str,
+        "return": return_annotation,
     }
     setattr(handler, "__signature__", handler_signature)
     return handler

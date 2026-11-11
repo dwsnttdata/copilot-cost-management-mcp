@@ -135,7 +135,11 @@ class WebAppMCPTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(exchange.call_count, 1, response.text)
         exchange.assert_called_once_with(user_token)
-        self.assertIn("policy-1", response.text)
+        payload = response.json()
+        self.assertEqual(
+            payload["result"]["structuredContent"],
+            {"id": "policy-1"},
+        )
 
     def test_reads_requested_scope_from_signed_in_user_token(self):
         self.assertEqual(
@@ -167,7 +171,7 @@ class WebAppMCPTests(unittest.IsolatedAsyncioTestCase):
             response = await handler(policy_id="policy-1", ctx=context)
 
         exchange.assert_called_once_with(user_token)
-        self.assertEqual(response, json.dumps(result))
+        self.assertEqual(response, result)
         self.assertIsNone(graph_access_token.get())
 
     async def test_tool_rejects_token_without_mcp_scope_before_obo(self):
